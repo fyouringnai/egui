@@ -32,7 +32,7 @@ struct MyApp {
 
 impl eframe::App for MyApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        ctx.style_mut(|style| style.interaction.tooltip_delay = 0.0);
+        ctx.all_styles_mut(|style| style.interaction.tooltip_delay = 0.0);
 
         egui::SidePanel::left("side_panel_left").show(ctx, |ui| {
             ui.heading("Information");
@@ -115,7 +115,7 @@ impl eframe::App for MyApp {
 
                 // combobox test
                 ui.add_space(20.0);
-                egui::ComboBox::from_id_source("combo_box")
+                egui::ComboBox::from_id_salt("combo_box")
                     .selected_text("click me")
                     .show_ui(ui, |ui| {
                         full_span_widget(ui, true);

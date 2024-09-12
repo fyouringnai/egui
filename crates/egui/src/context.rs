@@ -4,23 +4,39 @@ use std::{borrow::Cow, cell::RefCell, panic::Location, sync::Arc, time::Duration
 
 use containers::area::AreaState;
 use epaint::{
-    emath::TSTransform, mutex::*, stats::*, text::Fonts, util::OrderedFloat, TessellationOptions, *,
+    emath, emath::TSTransform, mutex::RwLock, pos2, stats::PaintStats, tessellator, text::Fonts,
+    util::OrderedFloat, vec2, ClippedPrimitive, ClippedShape, Color32, ImageData, ImageDelta, Pos2,
+    Rect, TessellationOptions, TextureAtlas, TextureId, Vec2,
 };
 
 use crate::{
     animation_manager::AnimationManager,
+    containers,
     data::output::PlatformOutput,
+    epaint,
     frame_state::FrameState,
-    input_state::*,
+    hit_test,
+    input_state::{InputState, MultiTouchInfo, PointerEvent},
+    interaction,
     layers::GraphicLayers,
+    load,
     load::{Bytes, Loaders, SizedTexture},
-    memory::Options,
+    memory::{Options, Theme},
+    menu,
     os::OperatingSystem,
     output::FullOutput,
+    resize, scroll_area,
     util::IdTypeMap,
     viewport::ViewportClass,
-    TextureHandle, ViewportCommand, *,
+    Align2, CursorIcon, DeferredViewportUiCallback, FontDefinitions, Grid, Id, ImmediateViewport,
+    ImmediateViewportRendererCallback, Key, KeyboardShortcut, Label, LayerId, Memory,
+    ModifierNames, NumExt, Order, Painter, RawInput, Response, RichText, ScrollArea, Sense, Style,
+    TextStyle, TextureHandle, TextureOptions, Ui, ViewportBuilder, ViewportCommand, ViewportId,
+    ViewportIdMap, ViewportIdPair, ViewportIdSet, ViewportOutput, Widget, WidgetRect, WidgetText,
 };
+
+#[cfg(feature = "accesskit")]
+use crate::IdMap;
 
 use self::{hit_test::WidgetHits, interaction::InteractionSnapshot};
 
@@ -471,7 +487,7 @@ impl ContextImpl {
             });
 
             viewport.hits = if let Some(pos) = viewport.input.pointer.interact_pos() {
-                let interact_radius = self.memory.options.style.interaction.interact_radius;
+                let interact_radius = self.memory.options.style().interaction.interact_radius;
 
                 crate::hit_test::hit_test(
                     &viewport.prev_frame.widgets,
@@ -567,7 +583,7 @@ impl ContextImpl {
             crate::profile_scope!("preload_font_glyphs");
             // Preload the most common characters for the most common fonts.
             // This is not very important to do, but may save a few GPU operations.
-            for font_id in self.memory.options.style.text_styles.values() {
+            for font_id in self.memory.options.style().text_styles.values() {
                 fonts.lock().fonts.font(font_id).preload_common_characters();
             }
         }
@@ -723,7 +739,7 @@ impl Context {
 
     /// Run the ui code for one frame.
     ///
-    /// Put your widgets into a [`SidePanel`], [`TopBottomPanel`], [`CentralPanel`], [`Window`] or [`Area`].
+    /// Put your widgets into a [`crate::SidePanel`], [`crate::TopBottomPanel`], [`crate::CentralPanel`], [`crate::Window`] or [`crate::Area`].
     ///
     /// This will modify the internal reference to point to a new generation of [`Context`].
     /// Any old clones of this [`Context`] will refer to the old [`Context`], which will not get new input.
@@ -1006,7 +1022,7 @@ impl Context {
                         tooltip_pos,
                         format!("Widget is {} this text.\n\n\
                              ID clashes happens when things like Windows or CollapsingHeaders share names,\n\
-                             or when things like Plot and Grid:s aren't given unique id_source:s.\n\n\
+                             or when things like Plot and Grid:s aren't given unique id_salt:s.\n\n\
                              Sometimes the solution is to use ui.push_id.",
                          if below { "above" } else { "below" })
                     );
@@ -1224,12 +1240,12 @@ impl Context {
 
     /// This is called by [`Response::widget_info`], but can also be called directly.
     ///
-    /// With some debug flags it will store the widget info in [`WidgetRects`] for later display.
+    /// With some debug flags it will store the widget info in [`crate::WidgetRects`] for later display.
     #[inline]
     pub fn register_widget_info(&self, id: Id, make_info: impl Fn() -> crate::WidgetInfo) {
         #[cfg(debug_assertions)]
         self.write(|ctx| {
-            if ctx.memory.options.style.debug.show_interactive_widgets {
+            if ctx.memory.options.style().debug.show_interactive_widgets {
                 ctx.viewport().this_frame.widgets.set_info(id, make_info());
             }
         });
@@ -1326,7 +1342,7 @@ impl Context {
 
     /// Format the given shortcut in a human-readable way (e.g. `Ctrl+Shift+X`).
     ///
-    /// Can be used to get the text for [`Button::shortcut_text`].
+    /// Can be used to get the text for [`crate::Button::shortcut_text`].
     pub fn format_shortcut(&self, shortcut: &KeyboardShortcut) -> String {
         let os = self.os();
 
@@ -1596,12 +1612,37 @@ impl Context {
         }
     }
 
-    /// The [`Style`] used by all subsequent windows, panels etc.
-    pub fn style(&self) -> Arc<Style> {
-        self.options(|opt| opt.style.clone())
+    /// Does the OS use dark or light mode?
+    /// This is used when the theme preference is set to [`crate::ThemePreference::System`].
+    pub fn system_theme(&self) -> Option<Theme> {
+        self.memory(|mem| mem.options.system_theme)
     }
 
-    /// Mutate the [`Style`] used by all subsequent windows, panels etc.
+    /// The [`Theme`] used to select the appropriate [`Style`] (dark or light)
+    /// used by all subsequent windows, panels etc.
+    pub fn theme(&self) -> Theme {
+        self.options(|opt| opt.theme())
+    }
+
+    /// The [`Theme`] used to select between dark and light [`Self::style`]
+    /// as the active style used by all subsequent windows, panels etc.
+    ///
+    /// Example:
+    /// ```
+    /// # let mut ctx = egui::Context::default();
+    /// ctx.set_theme(egui::Theme::Light); // Switch to light mode
+    /// ```
+    pub fn set_theme(&self, theme_preference: impl Into<crate::ThemePreference>) {
+        self.options_mut(|opt| opt.theme_preference = theme_preference.into());
+    }
+
+    /// The currently active [`Style`] used by all subsequent windows, panels etc.
+    pub fn style(&self) -> Arc<Style> {
+        self.options(|opt| opt.style().clone())
+    }
+
+    /// Mutate the currently active [`Style`] used by all subsequent windows, panels etc.
+    /// Use [`Self::all_styles_mut`] to mutate both dark and light mode styles.
     ///
     /// Example:
     /// ```
@@ -1611,29 +1652,85 @@ impl Context {
     /// });
     /// ```
     pub fn style_mut(&self, mutate_style: impl FnOnce(&mut Style)) {
-        self.options_mut(|opt| mutate_style(std::sync::Arc::make_mut(&mut opt.style)));
+        self.options_mut(|opt| mutate_style(Arc::make_mut(opt.style_mut())));
     }
 
-    /// The [`Style`] used by all new windows, panels etc.
+    /// The currently active [`Style`] used by all new windows, panels etc.
     ///
-    /// You can also change this using [`Self::style_mut`]
+    /// Use [`Self::all_styles_mut`] to mutate both dark and light mode styles.
+    ///
+    /// You can also change this using [`Self::style_mut`].
     ///
     /// You can use [`Ui::style_mut`] to change the style of a single [`Ui`].
     pub fn set_style(&self, style: impl Into<Arc<Style>>) {
-        self.options_mut(|opt| opt.style = style.into());
+        self.options_mut(|opt| *opt.style_mut() = style.into());
     }
 
-    /// The [`Visuals`] used by all subsequent windows, panels etc.
+    /// Mutate the [`Style`]s used by all subsequent windows, panels etc. in both dark and light mode.
+    ///
+    /// Example:
+    /// ```
+    /// # let mut ctx = egui::Context::default();
+    /// ctx.all_styles_mut(|style| {
+    ///     style.spacing.item_spacing = egui::vec2(10.0, 20.0);
+    /// });
+    /// ```
+    pub fn all_styles_mut(&self, mut mutate_style: impl FnMut(&mut Style)) {
+        self.options_mut(|opt| {
+            mutate_style(Arc::make_mut(&mut opt.dark_style));
+            mutate_style(Arc::make_mut(&mut opt.light_style));
+        });
+    }
+
+    /// The [`Style`] used by all subsequent windows, panels etc.
+    pub fn style_of(&self, theme: Theme) -> Arc<Style> {
+        self.options(|opt| match theme {
+            Theme::Dark => opt.dark_style.clone(),
+            Theme::Light => opt.light_style.clone(),
+        })
+    }
+
+    /// Mutate the [`Style`] used by all subsequent windows, panels etc.
+    ///
+    /// Example:
+    /// ```
+    /// # let mut ctx = egui::Context::default();
+    /// ctx.style_mut_of(egui::Theme::Dark, |style| {
+    ///     style.spacing.item_spacing = egui::vec2(10.0, 20.0);
+    /// });
+    /// ```
+    pub fn style_mut_of(&self, theme: Theme, mutate_style: impl FnOnce(&mut Style)) {
+        self.options_mut(|opt| match theme {
+            Theme::Dark => mutate_style(Arc::make_mut(&mut opt.dark_style)),
+            Theme::Light => mutate_style(Arc::make_mut(&mut opt.light_style)),
+        });
+    }
+
+    /// The [`Style`] used by all new windows, panels etc.
+    /// Use [`Self::set_theme`] to choose between dark and light mode.
+    ///
+    /// You can also change this using [`Self::style_mut_of`].
+    ///
+    /// You can use [`Ui::style_mut`] to change the style of a single [`Ui`].
+    pub fn set_style_of(&self, theme: Theme, style: impl Into<Arc<Style>>) {
+        let style = style.into();
+        self.options_mut(|opt| match theme {
+            Theme::Dark => opt.dark_style = style,
+            Theme::Light => opt.light_style = style,
+        });
+    }
+
+    /// The [`crate::Visuals`] used by all subsequent windows, panels etc.
     ///
     /// You can also use [`Ui::visuals_mut`] to change the visuals of a single [`Ui`].
     ///
     /// Example:
     /// ```
     /// # let mut ctx = egui::Context::default();
-    /// ctx.set_visuals(egui::Visuals::light()); // Switch to light mode
+    /// ctx.set_visuals_of(egui::Theme::Dark, egui::Visuals { panel_fill: egui::Color32::RED, ..Default::default() });
     /// ```
-    pub fn set_visuals(&self, visuals: crate::Visuals) {
-        self.options_mut(|opt| std::sync::Arc::make_mut(&mut opt.style).visuals = visuals);
+    pub fn set_visuals_of(&self, theme: Theme, visuals: crate::Visuals) {
+        self.style_mut_of(theme, |style| style.visuals = visuals);
     }
 
     /// The number of physical pixels for each logical point.
@@ -1656,7 +1753,7 @@ impl Context {
 
     /// The number of physical pixels for each logical point on this monitor.
     ///
-    /// This is given as input to egui via [`ViewportInfo::native_pixels_per_point`]
+    /// This is given as input to egui via [`crate::ViewportInfo::native_pixels_per_point`]
     /// and cannot be changed.
     #[inline(always)]
     pub fn native_pixels_per_point(&self) -> Option<f32> {
@@ -1701,26 +1798,42 @@ impl Context {
         });
     }
 
-    /// Useful for pixel-perfect rendering
+    /// Useful for pixel-perfect rendering of lines that are one pixel wide (or any odd number of pixels).
+    #[inline]
+    pub(crate) fn round_to_pixel_center(&self, point: f32) -> f32 {
+        let pixels_per_point = self.pixels_per_point();
+        ((point * pixels_per_point - 0.5).round() + 0.5) / pixels_per_point
+    }
+
+    /// Useful for pixel-perfect rendering of lines that are one pixel wide (or any odd number of pixels).
+    #[inline]
+    pub(crate) fn round_pos_to_pixel_center(&self, point: Pos2) -> Pos2 {
+        pos2(
+            self.round_to_pixel_center(point.x),
+            self.round_to_pixel_center(point.y),
+        )
+    }
+
+    /// Useful for pixel-perfect rendering of filled shapes
     #[inline]
     pub(crate) fn round_to_pixel(&self, point: f32) -> f32 {
         let pixels_per_point = self.pixels_per_point();
         (point * pixels_per_point).round() / pixels_per_point
     }
 
-    /// Useful for pixel-perfect rendering
+    /// Useful for pixel-perfect rendering of filled shapes
     #[inline]
     pub(crate) fn round_pos_to_pixels(&self, pos: Pos2) -> Pos2 {
         pos2(self.round_to_pixel(pos.x), self.round_to_pixel(pos.y))
     }
 
-    /// Useful for pixel-perfect rendering
+    /// Useful for pixel-perfect rendering of filled shapes
     #[inline]
     pub(crate) fn round_vec_to_pixels(&self, vec: Vec2) -> Vec2 {
         vec2(self.round_to_pixel(vec.x), self.round_to_pixel(vec.y))
     }
 
-    /// Useful for pixel-perfect rendering
+    /// Useful for pixel-perfect rendering of filled shapes
     #[inline]
     pub(crate) fn round_rect_to_pixels(&self, rect: Rect) -> Rect {
         Rect {
@@ -1744,7 +1857,7 @@ impl Context {
     ///
     /// The given name can be useful for later debugging, and will be visible if you call [`Self::texture_ui`].
     ///
-    /// For how to load an image, see [`ImageData`] and [`ColorImage::from_rgba_unmultiplied`].
+    /// For how to load an image, see [`crate::ImageData`] and [`crate::ColorImage::from_rgba_unmultiplied`].
     ///
     /// ```
     /// struct MyImage {
@@ -2263,7 +2376,7 @@ impl Context {
 
     /// True if egui is currently interested in the pointer (mouse or touch).
     ///
-    /// Could be the pointer is hovering over a [`Window`] or the user is dragging a widget.
+    /// Could be the pointer is hovering over a [`crate::Window`] or the user is dragging a widget.
     /// If `false`, the pointer is outside of any egui area and so
     /// you may be interested in what it is doing (e.g. controlling your game).
     /// Returns `false` if a drag started outside of egui and then moved over an egui area.
@@ -2279,7 +2392,7 @@ impl Context {
         self.memory(|m| m.interaction().is_using_pointer())
     }
 
-    /// If `true`, egui is currently listening on text input (e.g. typing text in a [`TextEdit`]).
+    /// If `true`, egui is currently listening on text input (e.g. typing text in a [`crate::TextEdit`]).
     pub fn wants_keyboard_input(&self) -> bool {
         self.memory(|m| m.focused().is_some())
     }
@@ -2320,7 +2433,7 @@ impl Context {
 
     /// If you detect a click or drag and wants to know where it happened, use this.
     ///
-    /// Latest position of the mouse, but ignoring any [`Event::PointerGone`]
+    /// Latest position of the mouse, but ignoring any [`crate::Event::PointerGone`]
     /// if there were interactions this frame.
     /// When tapping a touch screen, this will be the location of the touch.
     #[inline(always)]
@@ -2389,7 +2502,7 @@ impl Context {
 
     /// Moves the given area to the top in its [`Order`].
     ///
-    /// [`Area`]:s and [`Window`]:s also do this automatically when being clicked on or interacted with.
+    /// [`crate::Area`]:s and [`crate::Window`]:s also do this automatically when being clicked on or interacted with.
     pub fn move_to_top(&self, layer_id: LayerId) {
         self.memory_mut(|mem| mem.areas_mut().move_to_top(layer_id));
     }
@@ -2397,7 +2510,7 @@ impl Context {
     /// Mark the `child` layer as a sublayer of `parent`.
     ///
     /// Sublayers are moved directly above the parent layer at the end of the frame. This is mainly
-    /// intended for adding a new [`Area`] inside a [`Window`].
+    /// intended for adding a new [`crate::Area`] inside a [`crate::Window`].
     ///
     /// This currently only supports one level of nesting. If `parent` is a sublayer of another
     /// layer, the behavior is unspecified.
@@ -2449,13 +2562,13 @@ impl Context {
     /// Whether or not to debug widget layout on hover.
     #[cfg(debug_assertions)]
     pub fn debug_on_hover(&self) -> bool {
-        self.options(|opt| opt.style.debug.debug_on_hover)
+        self.options(|opt| opt.style().debug.debug_on_hover)
     }
 
     /// Turn on/off whether or not to debug widget layout on hover.
     #[cfg(debug_assertions)]
     pub fn set_debug_on_hover(&self, debug_on_hover: bool) {
-        self.style_mut(|style| style.debug.debug_on_hover = debug_on_hover);
+        self.all_styles_mut(|style| style.debug.debug_on_hover = debug_on_hover);
     }
 }
 
@@ -2582,7 +2695,7 @@ impl Context {
 
     /// Show the state of egui, including its input and output.
     pub fn inspection_ui(&self, ui: &mut Ui) {
-        use crate::containers::*;
+        use crate::containers::CollapsingHeader;
 
         ui.label(format!("Is using pointer: {}", self.is_using_pointer()))
             .on_hover_text(
@@ -2839,11 +2952,11 @@ impl Context {
 }
 
 impl Context {
-    /// Edit the active [`Style`].
-    pub fn style_ui(&self, ui: &mut Ui) {
-        let mut style: Style = (*self.style()).clone();
+    /// Edit the [`Style`].
+    pub fn style_ui(&self, ui: &mut Ui, theme: Theme) {
+        let mut style: Style = (*self.style_of(theme)).clone();
         style.ui(ui);
-        self.set_style(style);
+        self.set_style_of(theme, style);
     }
 }
 
@@ -2855,9 +2968,9 @@ impl Context {
     /// the function is still called, but with no other effect.
     ///
     /// No locks are held while the given closure is called.
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::unused_self, clippy::let_and_return)]
     #[inline]
-    pub fn with_accessibility_parent(&self, _id: Id, f: impl FnOnce()) {
+    pub fn with_accessibility_parent<R>(&self, _id: Id, f: impl FnOnce() -> R) -> R {
         // TODO(emilk): this isn't thread-safe - another thread can call this function between the push/pop calls
         #[cfg(feature = "accesskit")]
         self.frame_state_mut(|fs| {
@@ -2866,7 +2979,7 @@ impl Context {
             }
         });
 
-        f();
+        let result = f();
 
         #[cfg(feature = "accesskit")]
         self.frame_state_mut(|fs| {
@@ -2874,6 +2987,8 @@ impl Context {
                 assert_eq!(state.parent_stack.pop(), Some(_id));
             }
         });
+
+        result
     }
 
     /// If AccessKit support is active for the current frame, get or create
@@ -2985,7 +3100,7 @@ impl Context {
         }
     }
 
-    /// Release all memory and textures related to images used in [`Ui::image`] or [`Image`].
+    /// Release all memory and textures related to images used in [`Ui::image`] or [`crate::Image`].
     ///
     /// If you attempt to load any images again, they will be reloaded from scratch.
     pub fn forget_all_images(&self) {

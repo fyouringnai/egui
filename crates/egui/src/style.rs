@@ -7,8 +7,10 @@ use std::{collections::BTreeMap, ops::RangeInclusive, sync::Arc};
 use epaint::{Rounding, Shadow, Stroke};
 
 use crate::{
-    ecolor::*, emath::*, ComboBox, CursorIcon, FontFamily, FontId, Grid, Margin, Response,
-    RichText, TextWrapMode, WidgetText,
+    ecolor::Color32,
+    emath::{pos2, vec2, Rangef, Rect, Vec2},
+    ComboBox, CursorIcon, FontFamily, FontId, Grid, Margin, Response, RichText, TextWrapMode,
+    WidgetText,
 };
 
 /// How to format numbers in e.g. a [`crate::DragValue`].
@@ -174,7 +176,8 @@ impl From<TextStyle> for FontSelection {
 /// Specifies the look and feel of egui.
 ///
 /// You can change the visuals of a [`Ui`] with [`Ui::style_mut`]
-/// and of everything with [`crate::Context::set_style`].
+/// and of everything with [`crate::Context::set_style_of`].
+/// To choose between dark and light style, use [`crate::Context::set_theme`].
 ///
 /// If you want to change fonts, use [`crate::Context::set_fonts`] instead.
 #[derive(Clone, Debug, PartialEq)]
@@ -204,12 +207,10 @@ pub struct Style {
     /// use egui::FontFamily::Proportional;
     /// use egui::FontId;
     /// use egui::TextStyle::*;
-    ///
-    /// // Get current context style
-    /// let mut style = (*ctx.style()).clone();
+    /// use std::collections::BTreeMap;
     ///
     /// // Redefine text_styles
-    /// style.text_styles = [
+    /// let text_styles: BTreeMap<_, _> = [
     ///   (Heading, FontId::new(30.0, Proportional)),
     ///   (Name("Heading2".into()), FontId::new(25.0, Proportional)),
     ///   (Name("Context".into()), FontId::new(23.0, Proportional)),
@@ -219,8 +220,8 @@ pub struct Style {
     ///   (Small, FontId::new(10.0, Proportional)),
     /// ].into();
     ///
-    /// // Mutate global style with above changes
-    /// ctx.set_style(style);
+    /// // Mutate global styles with new text styles
+    /// ctx.all_styles_mut(move |style| style.text_styles = text_styles.clone());
     /// ```
     pub text_styles: BTreeMap<TextStyle, FontId>,
 
@@ -361,7 +362,7 @@ pub struct Spacing {
     /// Default (minimum) width of a [`ComboBox`].
     pub combo_width: f32,
 
-    /// Default width of a [`TextEdit`].
+    /// Default width of a [`crate::TextEdit`].
     pub text_edit_width: f32,
 
     /// Checkboxes, radio button and collapsing headers have an icon at the start.
@@ -853,7 +854,7 @@ impl Default for TextCursorStyle {
 /// Controls the visual style (colors etc) of egui.
 ///
 /// You can change the visuals of a [`Ui`] with [`Ui::visuals_mut`]
-/// and of everything with [`crate::Context::set_visuals`].
+/// and of everything with [`crate::Context::set_visuals_of`].
 ///
 /// If you want to change fonts, use [`crate::Context::set_fonts`] instead.
 #[derive(Clone, Debug, PartialEq)]
@@ -887,7 +888,7 @@ pub struct Visuals {
 
     pub selection: Selection,
 
-    /// The color used for [`Hyperlink`],
+    /// The color used for [`crate::Hyperlink`],
     pub hyperlink_color: Color32,
 
     /// Something just barely different from the background color.
@@ -1489,7 +1490,10 @@ impl Default for Widgets {
 
 // ----------------------------------------------------------------------------
 
-use crate::{widgets::*, Ui};
+use crate::{
+    widgets::{reset_button, DragValue, Slider, Widget},
+    Ui,
+};
 
 impl Style {
     pub fn ui(&mut self, ui: &mut crate::Ui) {
@@ -1514,8 +1518,6 @@ impl Style {
             scroll_animation,
         } = self;
 
-        visuals.light_dark_radio_buttons(ui);
-
         crate::Grid::new("_options").show(ui, |ui| {
             ui.label("Override font id");
             ui.vertical(|ui| {
@@ -1532,7 +1534,7 @@ impl Style {
             ui.end_row();
 
             ui.label("Override text style");
-            crate::ComboBox::from_id_source("Override text style")
+            crate::ComboBox::from_id_salt("Override text style")
                 .selected_text(match override_text_style {
                     None => "None".to_owned(),
                     Some(override_text_style) => override_text_style.to_string(),
@@ -1549,7 +1551,7 @@ impl Style {
             ui.end_row();
 
             ui.label("Text style of DragValue");
-            crate::ComboBox::from_id_source("drag_value_text_style")
+            crate::ComboBox::from_id_salt("drag_value_text_style")
                 .selected_text(drag_value_text_style.to_string())
                 .show_ui(ui, |ui| {
                     let all_text_styles = ui.style().text_styles();
@@ -1562,7 +1564,7 @@ impl Style {
             ui.end_row();
 
             ui.label("Text Wrap Mode");
-            crate::ComboBox::from_id_source("text_wrap_mode")
+            crate::ComboBox::from_id_salt("text_wrap_mode")
                 .selected_text(format!("{wrap_mode:?}"))
                 .show_ui(ui, |ui| {
                     let all_wrap_mode: Vec<Option<TextWrapMode>> = vec![
@@ -1926,38 +1928,6 @@ impl WidgetVisuals {
 }
 
 impl Visuals {
-    /// Show radio-buttons to switch between light and dark mode.
-    pub fn light_dark_radio_buttons(&mut self, ui: &mut crate::Ui) {
-        ui.horizontal(|ui| {
-            ui.selectable_value(self, Self::light(), "☀ Light");
-            ui.selectable_value(self, Self::dark(), "🌙 Dark");
-        });
-    }
-
-    /// Show small toggle-button for light and dark mode.
-    #[must_use]
-    pub fn light_dark_small_toggle_button(&self, ui: &mut crate::Ui) -> Option<Self> {
-        #![allow(clippy::collapsible_else_if)]
-        if self.dark_mode {
-            if ui
-                .add(Button::new("☀").frame(false))
-                .on_hover_text("Switch to light mode")
-                .clicked()
-            {
-                return Some(Self::light());
-            }
-        } else {
-            if ui
-                .add(Button::new("🌙").frame(false))
-                .on_hover_text("Switch to dark mode")
-                .clicked()
-            {
-                return Some(Self::dark());
-            }
-        }
-        None
-    }
-
     pub fn ui(&mut self, ui: &mut crate::Ui) {
         let Self {
             dark_mode: _,
@@ -2472,8 +2442,12 @@ impl Widget for &mut Stroke {
 
             // stroke preview:
             let (_id, stroke_rect) = ui.allocate_space(ui.spacing().interact_size);
-            let left = stroke_rect.left_center();
-            let right = stroke_rect.right_center();
+            let left = ui
+                .painter()
+                .round_pos_to_pixel_center(stroke_rect.left_center());
+            let right = ui
+                .painter()
+                .round_pos_to_pixel_center(stroke_rect.right_center());
             ui.painter().line_segment([left, right], (*width, *color));
         })
         .response
