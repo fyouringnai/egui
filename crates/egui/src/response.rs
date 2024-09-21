@@ -116,8 +116,23 @@ pub struct Response {
     ///
     /// e.g. the slider was dragged, text was entered in a [`TextEdit`](crate::TextEdit) etc.
     /// Always `false` for something like a [`Button`](crate::Button).
+    ///
+    /// Note that this can be `true` even if the user did not interact with the widget,
+    /// for instance if an existing slider value was clamped to the given range.
     #[doc(hidden)]
     pub changed: bool,
+
+    /// The intrinsic / desired size of the widget.
+    ///
+    /// For a button, this will be the size of the label + the frames padding,
+    /// even if the button is laid out in a justified layout and the actual size will be larger.
+    ///
+    /// If this is `None`, use [`Self::rect`] instead.
+    ///
+    /// At the time of writing, this is only used by external crates
+    /// for improved layouting.
+    /// See for instance [`egui_flex`](https://github.com/lucasmerlin/hello_egui/tree/main/crates/egui_flex).
+    pub intrinsic_size: Option<Vec2>,
 }
 
 impl Response {
@@ -496,6 +511,9 @@ impl Response {
     ///
     /// This is not set if the *view* of the data was changed.
     /// For instance, moving the cursor in a [`TextEdit`](crate::TextEdit) does not set this to `true`.
+    ///
+    /// Note that this can be `true` even if the user did not interact with the widget,
+    /// for instance if an existing slider value was clamped to the given range.
     #[inline(always)]
     pub fn changed(&self) -> bool {
         self.changed
@@ -857,14 +875,17 @@ impl Response {
             return self.clone();
         }
 
-        self.ctx.create_widget(WidgetRect {
-            layer_id: self.layer_id,
-            id: self.id,
-            rect: self.rect,
-            interact_rect: self.interact_rect,
-            sense: self.sense | sense,
-            enabled: self.enabled,
-        })
+        self.ctx.create_widget(
+            WidgetRect {
+                layer_id: self.layer_id,
+                id: self.id,
+                rect: self.rect,
+                interact_rect: self.interact_rect,
+                sense: self.sense | sense,
+                enabled: self.enabled,
+            },
+            true,
+        )
     }
 
     /// Adjust the scroll position until this UI becomes visible.
@@ -1138,6 +1159,7 @@ impl Response {
                 || other.is_pointer_button_down_on,
             interact_pointer_pos: self.interact_pointer_pos.or(other.interact_pointer_pos),
             changed: self.changed || other.changed,
+            intrinsic_size: None,
         }
     }
 }
